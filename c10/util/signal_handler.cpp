@@ -180,12 +180,12 @@ void FatalSignalHandler::stacktraceSignalHandler(bool needsLock) {
 
 void FatalSignalHandler::fatalSignalHandlerPostProcess() {}
 
-void FatalSignalHandler::fatalSignalHandlerStatic(int signum) {
-  getInstance().fatalSignalHandler(signum);
+void FatalSignalHandler::fatalSignalHandlerStatic(int signum, siginfo_t* info, void* ctx) {
+  getInstance().fatalSignalHandler(signum, info);
 }
 
 // Our fatal signal entry point
-void FatalSignalHandler::fatalSignalHandler(int signum) {
+void FatalSignalHandler::fatalSignalHandler(int signum, siginfo_t* info) {
   // Check if this is a proper signal that we declared above.
   const char* name = getSignalName(signum);
   if (!name) {
@@ -237,7 +237,21 @@ void FatalSignalHandler::fatalSignalHandler(int signum) {
   }
   fatalSignalHandlerPostProcess();
   sigaction(signum, getPreviousSigaction(signum), nullptr);
-  raise(signum);
+
+  // Re-raise the signal exactly as it was received.
+  // raise() actually calls tgkill(), which will replace the body
+  // of certain signals, like SEGV, with the uid and pid of the calling process.
+  // Which is not what we want.
+  int pidfd = pidfd_open(getpid(), 0);
+  if (pidfd == -1 || syscall(SYS_pidfd_send_signal, pidfd, signum, info) == -1) {
+      // If we failed to send the signal, we re-raise. We could return and 
+      // let the faulting instruction be re-executed, but it can be unsafe to
+      // do so. For example if the memory region that caused a SIGSEGV changed
+      // we could potentially not refault. To avoid that, we re-raise
+      // even if we delete some information from the coredump.
+      raise(signum);
+  }
+
 }
 
 // Our SIGUSR2 entry point
@@ -277,7 +291,7 @@ void FatalSignalHandler::installFatalSignalHandlers() {
   // Since we'll be in an exiting situation it's possible there's memory
   // corruption, so make our own stack just in case.
   sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
-  sa.sa_handler = FatalSignalHandler::fatalSignalHandlerStatic;
+  sa.sa_sigaction = FatalSignalHandler::fatalSignalHandlerStatic;
   for (auto* handler = kSignalHandlers; handler->name != nullptr; handler++) {
     if (sigaction(handler->signum, &sa, &handler->previous)) {
       std::string str("Failed to add ");
